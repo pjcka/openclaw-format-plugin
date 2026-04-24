@@ -1,0 +1,15 @@
+{
+  "id": "format",
+  "name": "Format",
+  "description": "Format — chat + doc editor, as an OpenClaw channel",
+  "version": "0.1.0",
+  "channels": ["format"],
+  "channelEnvVars": {
+    "format": ["SUPABASE_SERVICE_ROLE_KEY", "FORMAT_INBOUND_WEBHOOK_SECRET"]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
