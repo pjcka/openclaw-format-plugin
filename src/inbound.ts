@@ -8,8 +8,6 @@
 // module graph — `$lib/utils/logger` is not reachable here. Using `console.*`
 // (and the `log` callback passed in via `StartAccountCtx`) is the sanctioned
 // pattern for plugin logging (see CLAUDE.md "Logging" section).
-// This replaces scripts/openclaw-bridge.mjs's Realtime subscription +
-// synchronous /v1/chat/completions loop.
 //
 // Polling (not Realtime) because Supabase Realtime subscriptions consistently
 // returned CHANNEL_ERROR inside the gateway process, even though the same

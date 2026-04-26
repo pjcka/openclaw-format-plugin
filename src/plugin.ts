@@ -6,9 +6,8 @@
 //   (see ./status.ts + ./workers-poller.ts)
 //
 // Runs in-process inside the OpenClaw gateway. See
-// docs/reference/openclaw-channel-plugin-migration.md for the archival
-// migration record and docs/reference/openclaw-async-delegation.md for the
-// deferred "async subagent resurfacing" analysis.
+// docs/reference/openclaw-async-delegation.md for the deferred
+// "async subagent resurfacing" analysis.
 
 import {
 	createChatChannelPlugin,

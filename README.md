@@ -2,17 +2,12 @@
 
 An in-process OpenClaw channel plugin that lets the gateway treat Format as a
 first-class chat channel — same way it treats Slack, Discord, BlueBubbles, etc.
-Replaces the out-of-tree HTTP bridge at `../../scripts/openclaw-bridge.mjs`.
 
 ## What this does
 
-- Subscribes to Supabase Realtime on `chat_messages` to pick up new user
-  messages (replacing the bridge's Realtime subscription).
+- Subscribes to Supabase Realtime on `chat_messages` to pick up new user messages.
 - Dispatches them into the OpenClaw agent pipeline via the public plugin SDK
-  (`dispatchInboundMessage`). Critically, this waits natively through subagent
-  delegation — unlike the bridge's `/v1/chat/completions` call, which returned
-  with empty payloads and surfaced the literal string
-  `"No response from OpenClaw."` as the assistant reply.
+  (`dispatchInboundMessage`), which waits natively through subagent delegation.
 - Writes assistant replies back to Format's `chat_messages` via
   `outbound.attachedResults.sendText` and a cached Supabase service-role client.
 - Writes status/stage/worker columns on `chat_threads` from the agent event
@@ -28,8 +23,7 @@ ln -s "$(pwd)/plugins/openclaw-format" ~/.openclaw/plugins/format
 ```
 
 Then register in `~/.openclaw/openclaw.json` under `plugins.load.paths` +
-`plugins.entries.format` + `channels.format.accounts.default`. See the plan
-doc at `docs/reference/openclaw-channel-plugin-plan.md` for the exact snippet.
+`plugins.entries.format` + `channels.format.accounts.default`.
 
 ## Why this lives in Format's repo
 
@@ -54,8 +48,4 @@ openclaw --dev gateway
 
 ## Status
 
-Shipped — phases 1–5 landed in PR #274 (April 2026). Cutover commit
-`e35c2cc`; the deprecated `scripts/openclaw-bridge.mjs` is scheduled for
-deletion on 2026-04-28 after the stability window closes. Implementation
-notes in `docs/reference/openclaw-channel-plugin-plan.md` and
-`docs/reference/openclaw-channel-plugin-migration.md`.
+Shipped in PR #274 (April 2026).
