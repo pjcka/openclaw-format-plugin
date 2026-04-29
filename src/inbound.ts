@@ -1,21 +1,9 @@
-// Inbound pipeline — `base.gateway.startAccount(ctx)` runs for the lifetime
-// of the account. Polls Supabase for new user messages on chat_messages,
-// atomically claims them (avoiding double-dispatch if another worker ever
-// runs), and hands each off to dispatchInboundMessage so the OpenClaw agent
-// pipeline processes it natively — including subagent waits, tool calls, etc.
-//
-// Plugin runs inside the OpenClaw gateway process, outside the SvelteKit
-// module graph — `$lib/utils/logger` is not reachable here. Using `console.*`
-// (and the `log` callback passed in via `StartAccountCtx`) is the sanctioned
-// pattern for plugin logging (see CLAUDE.md "Logging" section).
-//
-// Polling (not Realtime) because Supabase Realtime subscriptions consistently
-// returned CHANNEL_ERROR inside the gateway process, even though the same
-// pattern works in a standalone Node script. For Format's current
-// single-user-single-gateway deployment, a 2s poll is indistinguishable from
-// Realtime-driven dispatch. Revisit if we scale past that.
+// Inbound pipeline: Realtime push primary, safety poll fallback (60s drift-catch
+// when healthy, 2s when degraded). Atomic claim in handleInbound makes the race
+// safe. Plugin runs outside the SvelteKit module graph; `console.*` is sanctioned
+// per CLAUDE.md.
 
-import type { SupabaseClient } from '@supabase/supabase-js';
+import type { SupabaseClient, RealtimeChannel } from '@supabase/supabase-js';
 import {
 	createReplyDispatcher,
 	dispatchInboundMessage
@@ -113,7 +101,28 @@ type ChatMessageRow = {
 
 const CHANNEL_ID = 'format';
 const AGENT_ID = 'main';
-const POLL_INTERVAL_MS = 2000;
+// Healthy = drift-catch when Realtime is up; degraded = original 2s poll cadence.
+const SAFETY_POLL_INTERVAL_HEALTHY_MS = 60_000;
+const SAFETY_POLL_INTERVAL_DEGRADED_MS = 2_000;
+// Hard cap on the SELECT — without it, a hung fetch leaves the inflight flag stuck and the loop dies.
+const POLL_QUERY_TIMEOUT_MS = 5_000;
+// Belt-and-braces against any future await in the poll path that forgets a timeout.
+const POLL_WATCHDOG_MS = 30_000;
+// Mirrors openclaw's built-in Slack Socket Mode plugin (jitter avoids reconnect dogpile; maxAttempts surfaces stuck state, safety poll keeps chat working).
+const REALTIME_RECONNECT_POLICY = {
+	initialMs: 2_000,
+	maxMs: 30_000,
+	factor: 1.8,
+	jitter: 0.25,
+	maxAttempts: 12
+} as const;
+
+function computeReconnectDelayMs(attempt: number): number {
+	const { initialMs, maxMs, factor, jitter } = REALTIME_RECONNECT_POLICY;
+	const base = Math.min(maxMs, initialMs * Math.pow(factor, attempt));
+	const spread = base * jitter;
+	return Math.round(base + (Math.random() * 2 - 1) * spread);
+}
 
 export async function startFormatAccount(ctx: StartAccountCtx): Promise<void> {
 	const { account, cfg, abortSignal, log } = ctx;
@@ -145,7 +154,7 @@ export async function startFormatAccount(ctx: StartAccountCtx): Promise<void> {
 		);
 	}
 
-	log?.info?.(`[format:${account.accountId}] starting poll loop (interval ${POLL_INTERVAL_MS}ms)`);
+	log?.info?.(`[format:${account.accountId}] starting Realtime + safety-poll dispatcher`);
 
 	// Per-thread serialization — within-thread order matters, across-thread parallel so long turns don't block.
 	const threadQueues = new Map<string, Promise<void>>();
@@ -171,34 +180,147 @@ export async function startFormatAccount(ctx: StartAccountCtx): Promise<void> {
 		});
 	};
 
-	// Concurrent-poll guard prevents duplicate enqueues before the atomic claim fires inside handleInbound.
-	let polling = false;
+	// pollStartedAt initialized so the watchdog comparison is meaningful even if a future refactor flips pollInflight outside safetyPoll.
+	let pollInflight = false;
+	let pollStartedAt = Date.now();
 
-	const poll = async () => {
-		if (polling) return;
+	const safetyPoll = async (): Promise<void> => {
 		if (abortSignal.aborted) return;
-		polling = true;
+		if (pollInflight) {
+			if (Date.now() - pollStartedAt > POLL_WATCHDOG_MS) {
+				log?.warn?.(
+					`[format:${account.accountId}] safety-poll watchdog tripped after ${POLL_WATCHDOG_MS}ms; resetting flag`
+				);
+				pollInflight = false;
+			} else {
+				return;
+			}
+		}
+		pollStartedAt = Date.now();
+		pollInflight = true;
 		try {
 			await claimAndDispatchPending(supabase, userId, enqueueDispatch);
 		} catch (err) {
+			const isTimeout =
+				err instanceof Error &&
+				(err.name === 'AbortError' || err.name === 'TimeoutError' || err.message.includes('timeout'));
 			log?.warn?.(
-				`[format:${account.accountId}] poll error`,
+				isTimeout
+					? `[format:${account.accountId}] safety-poll SELECT timed out after ${POLL_QUERY_TIMEOUT_MS}ms`
+					: `[format:${account.accountId}] safety-poll error`,
 				err instanceof Error ? err.message : err
 			);
 		} finally {
-			polling = false;
+			pollInflight = false;
 		}
 	};
 
-	// First sweep happens immediately so messages queued while the gateway was
-	// down don't wait for the first tick.
-	void poll();
-	const timer = setInterval(poll, POLL_INTERVAL_MS);
+	// Dynamic safety-poll cadence — fast when Realtime is broken, slow drift-catch when healthy.
+	let safetyTimer: ReturnType<typeof setInterval> | null = null;
+	const setSafetyPollInterval = (intervalMs: number): void => {
+		if (safetyTimer) clearInterval(safetyTimer);
+		safetyTimer = setInterval(() => void safetyPoll(), intervalMs);
+	};
+
+	// Realtime is the fast path. Handler fires safetyPoll() rather than dispatching payload.new — keeps filtering centralized; atomic claim in handleInbound makes the race safe.
+	let channel: RealtimeChannel | null = null;
+	let reconnectAttempt = 0;
+	let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+	const cancelReconnect = (): void => {
+		if (reconnectTimer) {
+			clearTimeout(reconnectTimer);
+			reconnectTimer = null;
+		}
+	};
+
+	const scheduleReconnect = (): void => {
+		// reconnectTimer guard: re-arming on every CLOSED/CHANNEL_ERROR creates the CLOSED→reconnect→removeChannel→CLOSED dispatch loop seen in earlier deploys.
+		if (abortSignal.aborted || reconnectTimer) return;
+		if (reconnectAttempt >= REALTIME_RECONNECT_POLICY.maxAttempts) {
+			log?.error?.(
+				`[format:${account.accountId}] Realtime reconnect gave up after ${reconnectAttempt} attempts; safety poll continues at ${SAFETY_POLL_INTERVAL_DEGRADED_MS}ms`
+			);
+			return;
+		}
+		const delay = computeReconnectDelayMs(reconnectAttempt);
+		// Increment inside the timer body so the count reflects attempts taken, not scheduled.
+		reconnectTimer = setTimeout(() => {
+			reconnectTimer = null;
+			if (abortSignal.aborted) return;
+			reconnectAttempt += 1;
+			log?.info?.(
+				`[format:${account.accountId}] reconnecting Realtime (attempt ${reconnectAttempt}/${REALTIME_RECONNECT_POLICY.maxAttempts})`
+			);
+			if (channel) {
+				void supabase.removeChannel(channel);
+				channel = null;
+			}
+			startRealtime();
+		}, delay);
+	};
+
+	const startRealtime = (): void => {
+		if (abortSignal.aborted) return;
+		// myChannel closure-captured so the subscribe callback can short-circuit on removed-channel events; otherwise stale CLOSED tears down the new healthy channel.
+		const myChannel = supabase
+			.channel(`format-inbound-${userId.slice(0, 8)}`)
+			.on(
+				'postgres_changes',
+				{
+					event: 'INSERT',
+					schema: 'public',
+					table: 'chat_messages',
+					// Tenant-broad on purpose (postgres_changes filters don't compose); user_id boundary is enforced downstream in claimAndDispatchPending. See #353.
+					filter: 'role=eq.user'
+				},
+				() => {
+					void safetyPoll();
+				}
+			);
+		channel = myChannel;
+		myChannel.subscribe((status, err) => {
+			if (channel !== myChannel) return; // stale callback — channel was removed
+			if (status === 'SUBSCRIBED') {
+				reconnectAttempt = 0;
+				cancelReconnect(); // channel recovered on its own; firing the timer would tear down the healthy channel
+
+				log?.info?.(
+					`[format:${account.accountId}] Realtime SUBSCRIBED — safety poll → ${SAFETY_POLL_INTERVAL_HEALTHY_MS}ms`
+				);
+				setSafetyPollInterval(SAFETY_POLL_INTERVAL_HEALTHY_MS);
+				void safetyPoll(); // drain any rows that arrived during SUBSCRIBE handshake
+			} else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+				log?.warn?.(
+					`[format:${account.accountId}] Realtime ${status} — safety poll → ${SAFETY_POLL_INTERVAL_DEGRADED_MS}ms`,
+					err instanceof Error ? err.message : err
+				);
+				setSafetyPollInterval(SAFETY_POLL_INTERVAL_DEGRADED_MS);
+				void safetyPoll(); // first setInterval tick is intervalMs away — covers the cadence-change blind spot
+				scheduleReconnect();
+			} else if (status === 'CLOSED') {
+				log?.info?.(`[format:${account.accountId}] Realtime CLOSED`);
+				setSafetyPollInterval(SAFETY_POLL_INTERVAL_DEGRADED_MS);
+				void safetyPoll();
+				scheduleReconnect();
+			}
+		});
+	};
+
+	// Boot degraded; SUBSCRIBE callback drops to healthy. Immediate sweep drains anything queued while gateway was down.
+	setSafetyPollInterval(SAFETY_POLL_INTERVAL_DEGRADED_MS);
+	void safetyPoll();
+	startRealtime();
 
 	return new Promise<void>((resolve) => {
 		const onAbort = () => {
-			log?.info?.(`[format:${account.accountId}] stopping poll loop`);
-			clearInterval(timer);
+			log?.info?.(`[format:${account.accountId}] stopping inbound dispatcher`);
+			if (safetyTimer) clearInterval(safetyTimer);
+			cancelReconnect();
+			// Null channel BEFORE removeChannel — async CLOSED then hits the stale-callback guard and skips setSafetyPollInterval (which would orphan a timer).
+			const ch = channel;
+			channel = null;
+			if (ch) void supabase.removeChannel(ch);
 			resolve();
 		};
 		if (abortSignal.aborted) onAbort();
@@ -214,6 +336,8 @@ async function claimAndDispatchPending(
 	// Join through chat_threads for the user_id filter — chat_messages doesn't
 	// carry user_id directly, but each thread does, and RLS treats the join as
 	// an AND. Service-role still bypasses RLS, so the filter is explicit here.
+	// AbortSignal.timeout: protects against a hung fetch silently killing the
+	// dispatcher (the failure mode that broke prod when this was poll-only).
 	const { data, error } = await supabase
 		.from('chat_messages')
 		.select('id, thread_id, content, chat_threads!inner(user_id)')
@@ -221,7 +345,8 @@ async function claimAndDispatchPending(
 		.eq('status', 'pending')
 		.eq('chat_threads.user_id', userId)
 		.order('created_at', { ascending: true })
-		.limit(10);
+		.limit(10)
+		.abortSignal(AbortSignal.timeout(POLL_QUERY_TIMEOUT_MS));
 	if (error) throw error;
 	if (!data || data.length === 0) return;
 

@@ -89,7 +89,8 @@ export function getSupabaseClient(account: FormatResolvedAccount): SupabaseClien
 	const cached = clientCache.get(key);
 	if (cached) return cached;
 	const client = createClient(account.supabaseUrl, account.supabaseServiceRole, {
-		auth: { autoRefreshToken: false, persistSession: false }
+		auth: { autoRefreshToken: false, persistSession: false },
+		realtime: { heartbeatIntervalMs: 10_000 } // halved from Phoenix default; gateway event-loop saturation pushes heartbeat callbacks past the ~30s server timeout
 	});
 	clientCache.set(key, client);
 	return client;
