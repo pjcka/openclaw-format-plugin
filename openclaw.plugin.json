@@ -7,6 +7,18 @@
   "channelEnvVars": {
     "format": ["SUPABASE_SERVICE_ROLE_KEY", "FORMAT_INBOUND_WEBHOOK_SECRET"]
   },
+  "channelConfigs": {
+    "format": {
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {}
+      },
+      "label": "Format",
+      "description": "Format — chat + doc editor, as an OpenClaw channel"
+    }
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
