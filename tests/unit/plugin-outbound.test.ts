@@ -1,10 +1,7 @@
-// Tests for the OpenClaw channel plugin's outbound.ts — specifically the
-// path-traversal guard (isAllowedMediaPath) and the end-to-end inlining
-// behavior (inlineMediaAsMarkdown). The plugin has no test harness of its
-// own; this file piggybacks on Format's vitest setup via a relative import.
-//
-// Tracks the concern from PR #274 that a security-critical guard landed
-// without a regression test (follow-up #275).
+// Tests for outbound.ts — the path-traversal guard (isAllowedMediaPath) and
+// the end-to-end inlining behavior (inlineMediaAsMarkdown). Originally
+// imported from Format's tree (follow-up #275 from PR #274) and migrated
+// here when the plugin moved to its own repo.
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { homedir } from 'node:os';
@@ -20,7 +17,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
 import {
 	isAllowedMediaPath,
 	inlineMediaAsMarkdown
-} from '../../plugins/openclaw-format/src/outbound.ts';
+} from '../../src/outbound.ts';
 
 const ALLOWED_ROOT = resolve(homedir(), '.openclaw', 'media');
 

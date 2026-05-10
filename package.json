@@ -1,13 +1,22 @@
 {
-  "name": "openclaw-format",
-  "version": "0.1.0",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "@supabase/supabase-js": "^2.75.1"
-  },
-  "devDependencies": {
-    "@types/node": "^24.10.1",
-    "typescript": "^5.9.2"
-  }
+	"name": "openclaw-format",
+	"version": "0.2.0",
+	"private": true,
+	"type": "module",
+	"description": "Format channel plugin for OpenClaw",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/pjcka/openclaw-format-plugin.git"
+	},
+	"scripts": {
+		"test": "vitest run"
+	},
+	"dependencies": {
+		"@supabase/supabase-js": "^2.75.1"
+	},
+	"devDependencies": {
+		"@types/node": "^24.10.1",
+		"typescript": "^5.9.2",
+		"vitest": "^3.2.4"
+	}
 }
