@@ -391,7 +391,8 @@ async function handleInbound(
 		return;
 	}
 
-	const sessionKey = `format:${threadId}`;
+	// Canonical form — must match cfg.session.dmScope=per-channel-peer + agent id; plugin-shorthand causes session bifurcation (path A: toAgentStoreSessionKey produces "agent:main:format:<id>"; path B: buildAgentPeerSessionKey produces "agent:main:format:direct:<id>").
+	const sessionKey = `agent:main:format:direct:${threadId}`;
 	log?.info?.(`[format] dispatching ${msgId.slice(0, 8)} → ${sessionKey}`);
 
 	// Migration 039 status surface — flip the thread to running so the UI's
