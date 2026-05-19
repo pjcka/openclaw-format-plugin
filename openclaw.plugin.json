@@ -13,7 +13,35 @@
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "additionalProperties": false,
-        "properties": {}
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "defaultAccount": {
+            "type": "string"
+          },
+          "accounts": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "supabaseUrl": {
+                  "type": "string"
+                },
+                "supabaseServiceRole": {
+                  "type": "string"
+                },
+                "formatUrl": {
+                  "type": "string"
+                },
+                "inboundWebhookSecret": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
       },
       "label": "Format",
       "description": "Format — chat + doc editor, as an OpenClaw channel"
