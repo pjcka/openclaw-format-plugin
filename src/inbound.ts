@@ -391,7 +391,8 @@ async function handleInbound(
 		return;
 	}
 
-	const sessionKey = `format:${threadId}`;
+	// Must match dmScope=per-channel-peer key shape (buildAgentPeerSessionKey); shorthand bifurcates with toAgentStoreSessionKey path.
+	const sessionKey = `agent:main:format:direct:${threadId}`;
 	log?.info?.(`[format] dispatching ${msgId.slice(0, 8)} → ${sessionKey}`);
 
 	// Migration 039 status surface — flip the thread to running so the UI's
