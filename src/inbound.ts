@@ -11,7 +11,7 @@ import {
 import { createChannelReplyPipeline } from 'openclaw/plugin-sdk/channel-reply-pipeline';
 import type { FormatResolvedAccount } from './setup.ts';
 import { getSupabaseClient, sendTextToFormat } from './outbound.ts';
-import { setRunning, setStage, setIdle, setFailed, setActiveWorkers, writeHeartbeat } from './status.ts';
+import { setRunning, setStage, setIdle, setFailed, setActiveWorkers, writeHeartbeat, isThreadCancelling } from './status.ts';
 import { startWorkersPoll } from './workers-poller.ts';
 
 // Per-thread running poller. Lets a new turn take over cleanly and prevents
@@ -21,10 +21,6 @@ const activeWorkerPollers = new Map<string, () => void>();
 // Lets short ACP subworkers remain visible post-completion via the poller's
 // linger window (see workers-poller.ts WORKER_LINGER_MS).
 const POST_TURN_TAIL_MS = 10_000;
-// How often to check chat_threads.status for a user-initiated cancel. Cheap
-// single-row SELECT; 1s keeps the Stop button feeling responsive without
-// hammering the DB.
-const CANCEL_POLL_INTERVAL_MS = 1000;
 
 async function sweepStaleOnStartup(
 	supabase: SupabaseClient,
@@ -49,6 +45,9 @@ async function sweepStaleOnStartup(
 	if (n > 0) log?.info?.(`[format] startup sweep: marked ${n} thread(s) interrupted`);
 }
 
+// Realtime + 2s fallback poll on CHANNEL_ERROR; join-time read closes the pre-subscribe Stop race.
+const CANCEL_FALLBACK_POLL_MS = 2000;
+
 function startCancelWatcher(opts: {
 	supabase: SupabaseClient;
 	threadId: string;
@@ -56,27 +55,69 @@ function startCancelWatcher(opts: {
 	log?: StartAccountCtx['log'];
 }): () => void {
 	const { supabase, threadId, abortController, log } = opts;
-	let running = true;
-	const tick = async () => {
-		if (!running || abortController.signal.aborted) return;
+	let pollTimer: ReturnType<typeof setInterval> | undefined;
+
+	const tryAbortIfCancelling = async (source: 'join' | 'poll'): Promise<void> => {
+		if (abortController.signal.aborted) return;
 		try {
 			const { data } = await supabase
 				.from('chat_threads')
 				.select('status')
 				.eq('id', threadId)
-				.single();
+				.maybeSingle();
 			if (data?.status === 'cancelling' && !abortController.signal.aborted) {
-				log?.info?.(`[format] cancel observed for ${threadId.slice(0, 8)} — aborting dispatch`);
+				log?.info?.(`[format] cancel observed via ${source} for ${threadId.slice(0, 8)} — aborting dispatch`);
 				abortController.abort();
 			}
 		} catch {
-			/* best-effort; next tick */
+			/* best-effort */
 		}
 	};
-	const timer = setInterval(tick, CANCEL_POLL_INTERVAL_MS);
+
+	void tryAbortIfCancelling('join');
+
+	const startFallbackPoll = (): void => {
+		if (pollTimer) return;
+		pollTimer = setInterval(() => void tryAbortIfCancelling('poll'), CANCEL_FALLBACK_POLL_MS);
+	};
+
+	const channel: RealtimeChannel = supabase
+		.channel(`cancel-watch:${threadId}`)
+		.on(
+			'postgres_changes',
+			{
+				event: 'UPDATE',
+				schema: 'public',
+				table: 'chat_threads',
+				filter: `id=eq.${threadId}`
+			},
+			(payload) => {
+				const next = (payload.new as { status?: string }).status;
+				if (next === 'cancelling' && !abortController.signal.aborted) {
+					log?.info?.(`[format] cancel signal received for ${threadId.slice(0, 8)} — aborting dispatch`);
+					abortController.abort();
+				}
+			}
+		)
+		.subscribe((status, err) => {
+			if (status === 'SUBSCRIBED' && pollTimer) {
+				clearInterval(pollTimer);
+				pollTimer = undefined;
+				return;
+			}
+			if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+				console.warn('[format-plugin] cancel watcher Realtime degraded — fallback poll → 2000ms', {
+					threadId,
+					channelStatus: status,
+					error: err?.message
+				});
+				startFallbackPoll();
+			}
+		});
+
 	return () => {
-		running = false;
-		clearInterval(timer);
+		if (pollTimer) clearInterval(pollTimer);
+		void supabase.removeChannel(channel);
 	};
 }
 
@@ -567,7 +608,11 @@ async function handleInbound(
 		log?.info?.(`[format] completed ${msgId.slice(0, 8)}`);
 		await setIdle(supabase, threadId);
 	} catch (err) {
-		if (abortController.signal.aborted) {
+		// DB peek catches a Stop the user issued before the abort signal landed.
+		const cancelled =
+			abortController.signal.aborted ||
+			(await isThreadCancelling(supabase, threadId));
+		if (cancelled) {
 			// User-initiated stop. Don't revert-to-pending (that would trigger
 			// a retry on the next poll); just drop the turn and flip idle.
 			log?.info?.(`[format] ${msgId.slice(0, 8)} cancelled by user`);

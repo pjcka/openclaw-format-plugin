@@ -75,20 +75,21 @@ export async function setIdle(
 	supabase: SupabaseClient,
 	threadId: string
 ): Promise<void> {
-	// Graceful turn end: let the workers-poller tail own active_workers so
-	// chips linger briefly after completion. (setFailed intentionally clears
-	// the field immediately — failed turns shouldn't show "still working"
-	// chips.)
-	const { error } = await supabase
+	// Scoped to running|cancelling so a stale tail can't clobber a fresh turn (CLAUDE.md).
+	const { data, error } = await supabase
 		.from('chat_threads')
 		.update({
 			status: 'idle',
 			active_run_started_at: null,
 			active_run_stage: null
 		})
-		.eq('id', threadId);
+		.eq('id', threadId)
+		.in('status', ['running', 'cancelling'])
+		.select('id');
 	if (error) {
 		console.warn('[format-plugin] setIdle failed', { threadId, error: error.message });
+	} else if (!data || data.length === 0) {
+		console.debug('[format-plugin] setIdle skipped — thread no longer running/cancelling', { threadId });
 	}
 }
 
@@ -97,7 +98,8 @@ export async function setFailed(
 	threadId: string,
 	errorText: string
 ): Promise<void> {
-	const { error } = await supabase
+	// Scoped to running|cancelling so a late failure can't regress an already-idle or new-turn thread.
+	const { data, error } = await supabase
 		.from('chat_threads')
 		.update({
 			status: 'failed',
@@ -105,10 +107,26 @@ export async function setFailed(
 			active_run_stage: errorText.slice(0, 120),
 			active_workers: []
 		})
-		.eq('id', threadId);
+		.eq('id', threadId)
+		.in('status', ['running', 'cancelling'])
+		.select('id');
 	if (error) {
 		console.warn('[format-plugin] setFailed failed', { threadId, error: error.message });
+	} else if (!data || data.length === 0) {
+		console.debug('[format-plugin] setFailed skipped — thread no longer running/cancelling', { threadId });
 	}
+}
+
+export async function isThreadCancelling(
+	supabase: SupabaseClient,
+	threadId: string
+): Promise<boolean> {
+	const { data } = await supabase
+		.from('chat_threads')
+		.select('status')
+		.eq('id', threadId)
+		.maybeSingle();
+	return data?.status === 'cancelling';
 }
 
 export async function setActiveWorkers(
