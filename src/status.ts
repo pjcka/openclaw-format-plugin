@@ -121,12 +121,23 @@ export async function isThreadCancelling(
 	supabase: SupabaseClient,
 	threadId: string
 ): Promise<boolean> {
-	const { data } = await supabase
-		.from('chat_threads')
-		.select('status')
-		.eq('id', threadId)
-		.maybeSingle();
-	return data?.status === 'cancelling';
+	try {
+		const { data, error } = await supabase
+			.from('chat_threads')
+			.select('status')
+			.eq('id', threadId)
+			.maybeSingle();
+		if (error) {
+			console.warn('[format-plugin] isThreadCancelling read failed', { threadId, error: error.message });
+		}
+		return data?.status === 'cancelling';
+	} catch (err) {
+		console.warn('[format-plugin] isThreadCancelling threw', {
+			threadId,
+			error: err instanceof Error ? err.message : String(err)
+		});
+		return false;
+	}
 }
 
 export async function setActiveWorkers(

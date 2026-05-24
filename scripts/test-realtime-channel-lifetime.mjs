@@ -35,10 +35,11 @@ console.log(`[test] connecting to ${SUPABASE_URL}`);
 console.log(`[test] secret prefix: ${SECRET.slice(0, 12)}…`);
 console.log('[test] WARNING: stdout may include redacted-but-still-sensitive transport URLs — review before sharing');
 
-// supabase-js's Realtime client logs the full WebSocket URL on `transport`
-// events, which includes `?apikey=<full-secret>`. Redact before stdout.
-const REDACT_APIKEY = /(\bapikey=)[^&\s"]+/g;
-const redact = (s) => (typeof s === 'string' ? s.replace(REDACT_APIKEY, '$1<redacted>') : s);
+// Redact SECRET in any form (URL apikey=, JSON access_token, raw bearer); supabase-js leaks it via multiple shapes.
+const redact = (s) =>
+	typeof s === 'string'
+		? s.replaceAll(SECRET, '<redacted>').replace(/(\bapikey=)[^&\s"]+/g, '$1<redacted>')
+		: s;
 
 const supabase = createClient(SUPABASE_URL, SECRET, {
 	auth: { autoRefreshToken: false, persistSession: false },
