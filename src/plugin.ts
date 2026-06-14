@@ -3,7 +3,7 @@
 // - outbound: writes agent replies to chat_messages, base64-inlines media
 //   (see ./outbound.ts)
 // - status: chat_threads.status / stage / workers / heartbeat writes
-//   (see ./status.ts + ./workers-poller.ts)
+//   (see ./status.ts; live stage + worker chips via ./agent-events.ts hooks)
 //
 // Runs in-process inside the OpenClaw gateway. See
 // docs/reference/openclaw-async-delegation.md for the deferred

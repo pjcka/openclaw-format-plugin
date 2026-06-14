@@ -11,16 +11,8 @@ import {
 import { createChannelReplyPipeline } from 'openclaw/plugin-sdk/channel-reply-pipeline';
 import type { FormatResolvedAccount } from './setup.ts';
 import { getSupabaseClient, sendTextToFormat } from './outbound.ts';
-import { setRunning, setStage, setIdle, setFailed, setActiveWorkers, writeHeartbeat, isThreadCancelling } from './status.ts';
-import { startWorkersPoll } from './workers-poller.ts';
-
-// Per-thread running poller. Lets a new turn take over cleanly and prevents
-// the post-turn tail from overlapping with a fresh turn's poll.
-const activeWorkerPollers = new Map<string, () => void>();
-// Wait this long after a turn ends before the final clear of active_workers.
-// Lets short ACP subworkers remain visible post-completion via the poller's
-// linger window (see workers-poller.ts WORKER_LINGER_MS).
-const POST_TURN_TAIL_MS = 10_000;
+import { setRunning, setIdle, setFailed, writeHeartbeat, isThreadCancelling } from './status.ts';
+import { beginThreadStatus, endThreadStatus } from './agent-events.ts';
 
 async function sweepStaleOnStartup(
 	supabase: SupabaseClient,
@@ -439,16 +431,8 @@ async function handleInbound(
 	log?.info?.(`[format] dispatching ${msgId.slice(0, 8)} → ${sessionKey}`);
 
 	// Migration 039 status surface — flip the thread to running so the UI's
-	// status zone appears with an elapsed counter. Migration 040 active_workers
-	// come in via the per-thread worker-board poll started below.
+	// status zone appears with an elapsed counter.
 	await setRunning(supabase, threadId, 'Thinking');
-
-	// If a previous turn on this thread left a tail poller running, stop it
-	// cleanly before starting a fresh one.
-	const previous = activeWorkerPollers.get(threadId);
-	if (previous) previous();
-	const stopWorkersPoll = startWorkersPoll({ supabase, threadId });
-	activeWorkerPollers.set(threadId, stopWorkersPoll);
 
 	// Routes the agent's final text through outbound.attachedResults.sendText (inserts as role=assistant).
 	const pipeline = createChannelReplyPipeline({
@@ -562,50 +546,23 @@ async function handleInbound(
 		void writeHeartbeat(supabase, threadId);
 	}, 5000);
 
-	// Stage writer with dedupe — agent-runner emits onItemEvent on every item
-	// phase transition, often redundant with what we just wrote. One DB round
-	// trip per change is fine; per-duplicate is wasteful.
-	let lastStage = 'Thinking';
-	const maybeSetStage = (next: string): void => {
-		const trimmed = next.trim();
-		if (!trimmed || trimmed === lastStage || abortController.signal.aborted) return;
-		lastStage = trimmed;
-		void setStage(supabase, threadId, trimmed);
-	};
-
 	try {
+		// Register the thread with the live-status bridge: the global tool/subagent
+		// hooks (agent-events.ts) write active_run_stage + active_workers for this
+		// thread until endThreadStatus() in the finally below. Inside the try (and
+		// paired with that finally) so a throw can't leave the thread registered.
+		// Replaces the dead per-thread :8766 worker-board poll (removed in 2026.6.6).
+		beginThreadStatus({ supabase, threadId });
 		await dispatchInboundMessage({
 			ctx: msgCtx,
 			cfg,
 			dispatcher,
 			replyOptions: {
-				abortSignal: abortController.signal,
-				// Fires on tool phase start/update (publicly exported equivalent of
-				// agent-runner's private onAgentEvent tool stream). Slack/Discord/
-				// Telegram all use this same hook — see
-				// dist/extensions/slack/provider-*.js:2254.
-				onToolStart: (p: { name?: string; phase?: string }) => {
-					const name = p.name?.trim();
-					if (name) maybeSetStage(`Using ${name}`);
-				},
-				// Item-level events carry richer progress text (progressText >
-				// summary > title > name) and fire for tool/command/patch/search.
-				// Phase 'end' reverts to generic 'Thinking' so the stage reflects
-				// the agent is still processing post-tool, not the last tool name.
-				onItemEvent: (p: {
-					name?: string;
-					phase?: string;
-					title?: string;
-					summary?: string;
-					progressText?: string;
-				}) => {
-					if (p.phase === 'end') {
-						maybeSetStage('Thinking');
-						return;
-					}
-					const label = p.progressText ?? p.summary ?? p.title ?? p.name;
-					if (label && label.trim()) maybeSetStage(label.trim());
-				}
+				abortSignal: abortController.signal
+				// active_run_stage + active_workers are written by the live-status
+				// bridge (agent-events.ts) from before_tool_call/after_tool_call +
+				// subagent_spawned/ended hooks. The old onToolStart/onItemEvent
+				// reply hooks are suppressed under native Codex, so they're gone.
 			}
 		});
 		log?.info?.(`[format] completed ${msgId.slice(0, 8)}`);
@@ -639,15 +596,8 @@ async function handleInbound(
 	} finally {
 		clearInterval(heartbeatTimer);
 		stopCancelWatcher();
-		// Leave the poller running briefly so recently-finished chips linger
-		// visibly post-turn. A fresh turn on this thread preempts the tail via
-		// the activeWorkerPollers guard.
-		setTimeout(() => {
-			if (activeWorkerPollers.get(threadId) !== stopWorkersPoll) return;
-			stopWorkersPoll();
-			activeWorkerPollers.delete(threadId);
-			// Final clear — only if we're still the authoritative poller.
-			void setActiveWorkers(supabase, threadId, []);
-		}, POST_TURN_TAIL_MS);
+		// Stop tracking this thread's stage; clears chips after the linger.
+		// A fresh turn on this thread (beginThreadStatus) cancels the teardown.
+		endThreadStatus(threadId);
 	}
 }
