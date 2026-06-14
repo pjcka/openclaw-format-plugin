@@ -13,6 +13,7 @@ import type { FormatResolvedAccount } from './setup.ts';
 import { getSupabaseClient, sendTextToFormat } from './outbound.ts';
 import { setRunning, setIdle, setFailed, writeHeartbeat, isThreadCancelling } from './status.ts';
 import { beginThreadStatus, endThreadStatus } from './agent-events.ts';
+import { startCodexChipReconcile } from './codex-chips.ts';
 
 async function sweepStaleOnStartup(
 	supabase: SupabaseClient,
@@ -190,6 +191,11 @@ export async function startFormatAccount(ctx: StartAccountCtx): Promise<void> {
 	}
 
 	log?.info?.(`[format:${account.accountId}] starting Realtime + safety-poll dispatcher`);
+
+	// "Codex agent running" chips: reconcile codex-job's detached-job status files
+	// into chat_threads.active_workers. Runs for the account's lifetime (a job
+	// outlives the dispatch turn), torn down on abort.
+	startCodexChipReconcile({ supabase, abortSignal });
 
 	// Per-thread serialization — within-thread order matters, across-thread parallel so long turns don't block.
 	const threadQueues = new Map<string, Promise<void>>();

@@ -11,7 +11,8 @@
 // not the behavior).
 
 import type { SupabaseClient } from '@supabase/supabase-js';
-import { setStage, setActiveWorkers, type ActiveWorker } from './status.ts';
+import { setStage, type ActiveWorker } from './status.ts';
+import { writeSubagentChips } from './active-workers.ts';
 
 // ── Pure derivation ──────────────────────────────────────────────────────────
 
@@ -201,7 +202,9 @@ function flushStage(threadId: string, state: ThreadState): void {
 }
 
 function flushChips(threadId: string, state: ThreadState): void {
-	void setActiveWorkers(state.supabase, threadId, state.chips.list(Date.now()));
+	// Through the composer so codex chips (written by the reconcile) and these
+	// subagent chips share active_workers without clobbering each other.
+	writeSubagentChips(state.supabase, threadId, state.chips.list(Date.now()));
 }
 
 function scheduleFlush(threadId: string): void {
@@ -244,7 +247,9 @@ export function endThreadStatus(threadId: string): void {
 		// A fresh turn replaces the entry + cancels this timer; re-check so a stale
 		// teardown can never delete a newly-registered thread.
 		if (activeThreads.get(threadId) !== state) return;
-		void setActiveWorkers(state.supabase, threadId, []);
+		// Clears only the SUBAGENT slice — a still-running codex job keeps its chip
+		// via the reconcile's codex slice in the composer.
+		writeSubagentChips(state.supabase, threadId, []);
 		activeThreads.delete(threadId);
 		for (const [child, tid] of childThread) if (tid === threadId) childThread.delete(child);
 	}, WORKER_LINGER_MS + 500);
