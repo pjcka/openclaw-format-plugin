@@ -13,10 +13,8 @@
 - ✅ **Stage** ("Using <tool>") — SHIPPED. Tool hooks → `chat_threads.active_run_stage`.
 - ✅ **Session chips** (real `sessions_spawn` subagents) — SHIPPED. Cheap; rarely
   fires in Format (delegation goes through `codex_job`, not subagents — see below).
-- ✅ **Codex-agent chips** ("a codex agent is running for this session") — SHIPPED
-  via codex-job's existing status files (see "Codex-agent chips" below). The
-  majority delegation path. NOT via the OpenClaw task runtime — that route turned
-  out unsafe (see the rejected-approach note).
+- ⏳ **Codex-agent chips** ("a codex agent is running for this session") — Option B
+  below. The majority delegation path; not yet built.
 
 ## What shipped
 
@@ -62,47 +60,34 @@ removed `:8766` ACP worker board, NOT the native-Codex-suppressed
   stderr to `/dev/null`; only `console.log` → `gateway.log`). status.ts's own
   `console.warn` error paths are effectively silent — a latent observability bug.
 
-## Codex-agent chips (shipped)
+## Option B — codex-agent chips (next, by-the-book)
 
 **Finding:** Format delegates real work via the **`codex_job` tool** (a detached
 `codex exec`), NOT `sessions_spawn` subagents — so `subagent_spawned` rarely
 fires here. The codex_job tool hook only sees the ~5ms *dispatch*; the job then
 runs detached and wakes main ~seconds–minutes later via a "System note from the
-codex-job runner" turn. So a chip needs a real start+end lifecycle that OUTLIVES
-the dispatch turn.
+codex-job runner" turn. So a chip needs a real start+end lifecycle.
 
-**Shipped design: reconcile codex-job's own status files (the source of truth
-that already exists).** No OpenClaw task runtime, no cross-process coupling.
+**Chosen design (most by-the-book): route codex_job through OpenClaw's own
+detached-task runtime.**
 
-- **codex-job** (`~/.openclaw/plugins/codex-job`) already writes a per-job
-  `status.json` (`state: starting|running|done|failed|killed`, pid, timestamps).
-  One additive change: `createAndLaunch` now stamps `notifyChannel`/`notifyTarget`
-  into `meta.json` so a reader can map a job back to its Format thread. BB +
-  headless jobs are untouched (they carry a non-`format` channel and are ignored).
-- **Format plugin** (`src/codex-chips.ts`) runs a light reconcile (4s) for the
-  account's lifetime: read the `codex-jobs` dir, keep `format`-channel jobs in an
-  active state whose launcher pid is alive, project each to an `active_workers`
-  chip (`runtime: "codex"`), and clear it the tick after `status.json` goes
-  terminal. Survives a gateway restart (status.json persists).
-- **`src/active-workers.ts`** is a single composer for `chat_threads.active_workers`:
-  the live subagent-chip path and the codex reconcile each own a named slice and
-  the writer always persists their UNION (deduped). Without it, `endThreadStatus`'s
-  `active_workers=[]` teardown would erase a codex chip while its job still ran.
-- The Format UI already renders `active_workers` chips while a thread is idle
-  (`pendingActive = showPending || workers.length > 0`) — no UI change needed.
+- **codex-job plugin** (`~/.openclaw/plugins/codex-job`, openclaw-ops scope)
+  registers via `api.registerDetachedTaskRuntime(runtime: DetachedTaskLifecycleRuntime)`:
+  - `createRunningTaskRun({ requesterSessionKey: <originating>, label, runId, runtime })` at launch.
+  - `completeTaskRunByRunId` / `failTaskRunByRunId` at the completion wake.
+  - `cancelDetachedTaskRunById` ← wire `codex_job_stop`.
+  - `tryRecoverTaskBeforeMarkLost` ← answer liveness from the existing `status.json`/pid.
+    This is the platform's own solution to the out-of-process completion boundary —
+    no custom Format poll of private files.
+- **Format (and BB)** read chips via `api.runtime.tasks.runs.bindSession({sessionKey: parentKey}).list()`
+  filtered to `status: "running"` → channel-agnostic, BB gets it for free.
+  (Start can flip instantly off the `before_tool_call(codex_job)` hook; the
+  `.list()` reconcile handles end.)
+- Bonus: codex_job jobs become visible in `openclaw tasks` + gain platform cancel.
 
-**Rejected: register an OpenClaw `DetachedTaskLifecycleRuntime`.** Verified against
-the installed dist: `api.registerDetachedTaskRuntime` is a SINGLE exclusive global
-slot, and every core caller (subagent/acp/cron/native-harness) routes its task
-lifecycle through it. Claiming the slot puts codex-job in the critical path of
-BlueBubbles' own subagent/cron tasks, and there is no by-the-book way to delegate
-the non-codex calls back to core (the default helpers live in per-release
-hash-named internal modules with no `package.json` `exports` entry — the only
-exposed factory is `createAgentHarnessTaskRuntime`). Same hallucinated-symbol
-failure class as the original diagnostic-bus handoff. The file-reconcile is
-simpler, BB-safe, and more robust (no "lost"-marking of stale runs). Trade-off
-given up: codex jobs don't appear in `openclaw tasks` and `openclaw tasks cancel`
-won't kill one (the `codex_job_stop` tool still does).
+**Cost / risk:** a codex-job refactor (it serves the live BB surface → needs its
+own BB-safe verification). codex-job already holds all required state
+(`status.json`, pid) to implement the contract.
 
 ## Verification
 

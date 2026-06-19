@@ -119,57 +119,6 @@ function stripMediaSentinels(text: string): string {
 	return text.replace(MEDIA_SENTINEL_LINE_RE, '').trim();
 }
 
-// The OpenClaw agent emits an optional `TITLE: <label>` line with its reply —
-// same sentinel idea as MEDIA: above. Uppercase + line-leading only, so prose
-// that merely contains "title:" isn't stripped. Format owns persistence (a
-// manual rename wins); the agent only suggests.
-// Strip the whole line incl. its trailing newline so removal doesn't leave a
-// blank line mid-body; the capture variant (/m, no /g) reads the first value.
-const TITLE_SENTINEL_LINE_RE = /^[ \t]*TITLE:.*\n?/gm;
-const TITLE_SENTINEL_CAPTURE_RE = /^[ \t]*TITLE:[ \t]*(.*)$/m;
-const TITLE_MAX_CHARS = 60;
-
-// Exported for tests only; consumed by sendTextToFormat below.
-export function extractTitleSentinel(text: string): { title: string | null; body: string } {
-	const source = text ?? '';
-	const match = source.match(TITLE_SENTINEL_CAPTURE_RE);
-	const body = source.replace(TITLE_SENTINEL_LINE_RE, '').trim();
-	if (!match) return { title: null, body };
-
-	const cleaned = match[1]
-		.trim()
-		.replace(/^["'“”‘’]+|["'“”‘’]+$/g, '')
-		.replace(/\s+/g, ' ')
-		.trim();
-	// Cap by code point, not UTF-16 unit, so a boundary emoji can't leave a lone surrogate.
-	const normalized = [...cleaned].slice(0, TITLE_MAX_CHARS).join('').trim();
-	return { title: normalized || null, body };
-}
-
-// Persist the agent's suggested title under Format's manual-wins guard: write
-// only while title_source = 'auto' (a manual rename sets it to 'manual' and
-// matches zero rows). Byte-identical in meaning to Format's persistGeneratedTitle
-// and the incoming-chat RPC. Never throws — a title write must not fail the
-// reply that already landed.
-export async function persistThreadTitle(
-	supabase: SupabaseClient,
-	threadId: string,
-	title: string | null
-): Promise<void> {
-	if (!title) return;
-	const { error } = await supabase
-		.from('chat_threads')
-		.update({ title })
-		.eq('id', threadId)
-		.eq('title_source', 'auto');
-	if (error) {
-		console.warn('[format-plugin] thread title update failed', {
-			threadId,
-			error: error.message
-		});
-	}
-}
-
 export async function sendTextToFormat(
 	account: FormatResolvedAccount,
 	params: SendTextParams
@@ -180,18 +129,12 @@ export async function sendTextToFormat(
 		throw new Error('[format-plugin] sendText: missing thread_id in `to`');
 	}
 
-	const { title: suggestedTitle, body } = extractTitleSentinel(params.text ?? '');
-	const cleanedText = stripMediaSentinels(body);
+	const cleanedText = stripMediaSentinels(params.text ?? '');
 	const mediaMarkdown: string[] = [];
 	for (const path of params.mediaUrls ?? []) {
 		if (!path?.trim()) continue;
 		mediaMarkdown.push(await inlineMediaAsMarkdown(path.trim()));
 	}
-
-	// Persist the agent-suggested title (no-op if absent) before the empty-body
-	// early return, so a title-only turn still retitles. Guarded + non-throwing,
-	// so it never affects the reply path.
-	await persistThreadTitle(supabase, threadId, suggestedTitle);
 
 	const content = [cleanedText, ...mediaMarkdown].filter(Boolean).join('\n\n');
 	// An agent turn that's entirely a MEDIA-sentinel with no real media paths
