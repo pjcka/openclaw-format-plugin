@@ -301,10 +301,16 @@ describe('hook handler glue + lifecycle (integration)', () => {
 		expect(spawnWrite.active_workers[0].session_key).toBe('child-1');
 		expect(spawnWrite.active_workers[0].runtime).toBe('codex');
 
-		// If targetSessionKey didn't match childSessionKey, ended would no-op (no write).
-		const beforeEnd = sb.writes.length;
+		// ended sets the linger countdown but the visible set is unchanged, so the
+		// composer dedupes the end-time flush. The chip is pruned (and an empty
+		// active_workers written) only after the linger re-flush — and only if
+		// targetSessionKey routed back to child-1's thread in the first place.
 		h.subagent_ended({ targetSessionKey: 'child-1' }, {});
-		expect(sb.writes.length).toBeGreaterThan(beforeEnd);
+		vi.advanceTimersByTime(11_000); // past WORKER_LINGER_MS + 500 → re-flush prunes it
+		const lastWorkers = sb.writes.filter((w) => 'active_workers' in w).at(-1) as {
+			active_workers: unknown[];
+		};
+		expect(lastWorkers.active_workers).toHaveLength(0);
 	});
 
 	it('teardown survives a late subagent_ended — separate timers, no slot clobber', () => {
