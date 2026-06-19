@@ -11,6 +11,7 @@ import {
 import { createChannelReplyPipeline } from 'openclaw/plugin-sdk/channel-reply-pipeline';
 import type { FormatResolvedAccount } from './setup.ts';
 import { getSupabaseClient, sendTextToFormat } from './outbound.ts';
+import { withTitleInstruction } from './title-instruction.ts';
 import { setRunning, setIdle, setFailed, writeHeartbeat, isThreadCancelling } from './status.ts';
 import { beginThreadStatus, endThreadStatus } from './agent-events.ts';
 import { startCodexChipReconcile } from './codex-chips.ts';
@@ -514,9 +515,21 @@ async function handleInbound(
 		}
 	});
 
+	// Read the current title so the agent can decide whether to retitle (drift-only).
+	// Best-effort: a failed/absent read just means the agent sees "(untitled)".
+	const { data: threadRow } = await supabase
+		.from('chat_threads')
+		.select('title')
+		.eq('id', threadId)
+		.maybeSingle();
+	const bodyForAgent = withTitleInstruction(
+		body,
+		(threadRow as { title?: string | null } | null)?.title ?? null
+	);
+
 	const msgCtx = {
 		Body: body,
-		BodyForAgent: body,
+		BodyForAgent: bodyForAgent,
 		BodyForCommands: body,
 		RawBody: body,
 		CommandBody: body,
