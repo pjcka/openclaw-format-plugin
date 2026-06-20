@@ -274,6 +274,34 @@ describe('sendTextToFormat', () => {
 		).rejects.toThrow(/chat\/incoming POST failed: 401/);
 	});
 
+	it('throws when fetch itself rejects (network error)', async () => {
+		fetchMock.mockRejectedValueOnce(new Error('ECONNREFUSED'));
+		await expect(
+			sendTextToFormat(account, { cfg: {}, to: THREAD, text: 'Hello' }),
+		).rejects.toThrow(/ECONNREFUSED/);
+	});
+
+	it('returns an empty messageId when the response body is not JSON', async () => {
+		fetchMock.mockResolvedValueOnce({ ok: true, json: async () => { throw new Error('not json'); } });
+		const res = await sendTextToFormat(account, { cfg: {}, to: THREAD, text: 'Hello' });
+		expect(res).toEqual({ messageId: '' });
+	});
+
+	it('truncates reply text over the 10K cap, keeping media URLs intact', async () => {
+		readFileMock.mockResolvedValueOnce(Buffer.from('img'));
+		await sendTextToFormat(account, {
+			cfg: {},
+			to: THREAD,
+			text: 'A'.repeat(11000),
+			mediaUrls: [resolve(ALLOWED_ROOT, 'gen.png')],
+		});
+		const body = lastPostBody();
+		expect(body.content.length).toBeLessThanOrEqual(10000);
+		expect(body.content).toContain('…(truncated)');
+		// media URL survived the truncation
+		expect(body.content).toMatch(/\/api\/chat\/images\/.+\.png\)/);
+	});
+
 	it('throws when thread_id is missing', async () => {
 		await expect(sendTextToFormat(account, { cfg: {}, to: '  ', text: 'Hello' })).rejects.toThrow(
 			/missing thread_id/,

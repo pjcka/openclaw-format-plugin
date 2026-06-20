@@ -221,7 +221,20 @@ export async function sendTextToFormat(
 		}
 	}
 
-	const content = [cleanedText, ...mediaMarkdown].filter(Boolean).join('\n\n');
+	// /api/chat/incoming hard-caps content at 10K chars; truncate long reply TEXT
+	// (keeping the short media URLs intact) rather than 400 and lose the whole reply.
+	const CONTENT_MAX_CHARS = 10000; // matches Format's CHAT_INCOMING_MAX_CONTENT
+	const mediaBlock = mediaMarkdown.filter(Boolean).join('\n\n');
+	let text = cleanedText;
+	const sep = text && mediaBlock ? 2 : 0;
+	if (text.length + sep + mediaBlock.length > CONTENT_MAX_CHARS) {
+		const marker = '\n\n…(truncated)';
+		const budget = Math.max(0, CONTENT_MAX_CHARS - mediaBlock.length - sep - marker.length);
+		text = text.slice(0, budget).trimEnd() + marker;
+	}
+	let content = [text, mediaBlock].filter(Boolean).join('\n\n');
+	// Backstop for a pathological media-heavy turn (text already trimmed): land a clipped reply, never a 400.
+	if (content.length > CONTENT_MAX_CHARS) content = content.slice(0, CONTENT_MAX_CHARS);
 	// An agent turn with no text and no usable media would leave content empty —
 	// skip to avoid an empty assistant row (and the endpoint requires content).
 	if (!content) return null;
