@@ -1,31 +1,76 @@
-// Tests for outbound.ts — the path-traversal guard (isAllowedMediaPath) and
-// the end-to-end inlining behavior (inlineMediaAsMarkdown). Originally
-// imported from Format's tree (follow-up #275 from PR #274) and migrated
-// here when the plugin moved to its own repo.
+// Tests for outbound.ts — the path-traversal guard (isAllowedMediaPath), media
+// upload to the chat-images bucket (uploadMediaAsMarkdown), the TITLE: sentinel
+// parser, and the reply transport (sendTextToFormat POSTs to /api/chat/incoming
+// — no direct chat_messages / chat_threads write).
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { homedir } from 'node:os';
 import { resolve, sep } from 'node:path';
 
-const { readFileMock } = vi.hoisted(() => ({ readFileMock: vi.fn() }));
+const { readFileMock, uploadMock, maybeSingleMock, fromMock, fetchMock } = vi.hoisted(() => {
+	const maybeSingleMock = vi.fn();
+	return {
+		readFileMock: vi.fn(),
+		uploadMock: vi.fn(),
+		maybeSingleMock,
+		fromMock: vi.fn(() => ({ select: () => ({ eq: () => ({ maybeSingle: maybeSingleMock }) }) })),
+		fetchMock: vi.fn(),
+	};
+});
+
 vi.mock('node:fs/promises', async (importOriginal) => {
 	const actual = (await importOriginal()) as typeof import('node:fs/promises');
 	return { ...actual, default: { ...actual, readFile: readFileMock }, readFile: readFileMock };
 });
 
-// Not imported directly — we drive it via readFileMock below.
+// getSupabaseClient() builds its client via createClient — return a stub whose
+// storage.upload + from() chain the tests drive.
+vi.mock('@supabase/supabase-js', () => ({
+	createClient: () => ({
+		storage: { from: () => ({ upload: uploadMock }) },
+		from: fromMock,
+	}),
+}));
+
+vi.stubGlobal('fetch', fetchMock);
+
 import {
 	isAllowedMediaPath,
-	inlineMediaAsMarkdown,
+	uploadMediaAsMarkdown,
 	extractTitleSentinel,
-	persistThreadTitle
+	sendTextToFormat,
 } from '../../src/outbound.ts';
 
 const ALLOWED_ROOT = resolve(homedir(), '.openclaw', 'media');
+const OWNER = '11111111-1111-1111-1111-111111111111';
+const THREAD = '22222222-2222-2222-2222-222222222222';
+
+const account = {
+	accountId: 'default',
+	supabaseUrl: 'https://proj.supabase.co',
+	supabaseServiceRole: 'service-role-key',
+	formatUrl: 'https://format.example/',
+	inboundWebhookSecret: 'whsec_1234567890abcdef',
+	token: 'service-role-key',
+	allowFrom: [],
+	dmPolicy: undefined,
+} as Parameters<typeof sendTextToFormat>[0];
 
 beforeEach(() => {
+	vi.clearAllMocks();
 	readFileMock.mockReset();
+	fetchMock.mockResolvedValue({
+		ok: true,
+		json: async () => ({ message_id: 'msg-1', thread_id: THREAD }),
+	});
+	maybeSingleMock.mockResolvedValue({ data: { user_id: OWNER }, error: null });
+	uploadMock.mockResolvedValue({ error: null });
 });
+
+function lastPostBody() {
+	const [, init] = fetchMock.mock.calls.at(-1)!;
+	return JSON.parse((init as RequestInit).body as string);
+}
 
 describe('isAllowedMediaPath', () => {
 	it('accepts paths under the allowed root', () => {
@@ -39,81 +84,74 @@ describe('isAllowedMediaPath', () => {
 	});
 
 	it('rejects traversal via .. even when prefix looks allowed', () => {
-		// path.resolve normalizes .. before the prefix check.
 		const traversal = ALLOWED_ROOT + sep + '..' + sep + 'sensitive.png';
 		expect(isAllowedMediaPath(traversal)).toBe(false);
 	});
 
 	it('rejects the sibling-directory prefix trick', () => {
-		// Example: if ALLOWED_ROOT = /Users/pa/.openclaw/media, a path like
-		// /Users/pa/.openclaw/media-shadow/evil.png starts with the root string
-		// but is NOT a child — the trailing `sep` check blocks it.
 		const sibling = ALLOWED_ROOT + '-shadow' + sep + 'evil.png';
 		expect(isAllowedMediaPath(sibling)).toBe(false);
 	});
 
 	it('rejects relative paths that resolve outside the root', () => {
-		// resolve() against cwd; pretty much always != the openclaw media dir.
 		expect(isAllowedMediaPath('./foo.png')).toBe(false);
 	});
 });
 
-describe('inlineMediaAsMarkdown', () => {
-	it('returns blocked marker for paths outside the root', async () => {
-		const out = await inlineMediaAsMarkdown('/etc/hosts');
+describe('uploadMediaAsMarkdown', () => {
+	function stub() {
+		return { storage: { from: () => ({ upload: uploadMock }) } } as never;
+	}
+
+	it('returns blocked marker for paths outside the root (never reads or uploads)', async () => {
+		const out = await uploadMediaAsMarkdown(stub(), OWNER, THREAD, '/etc/hosts');
 		expect(out).toBe('_(attachment blocked: hosts)_');
 		expect(readFileMock).not.toHaveBeenCalled();
+		expect(uploadMock).not.toHaveBeenCalled();
 	});
 
 	it('returns unsupported marker for disallowed extensions', async () => {
-		const out = await inlineMediaAsMarkdown(resolve(ALLOWED_ROOT, 'doc.pdf'));
+		const out = await uploadMediaAsMarkdown(stub(), OWNER, THREAD, resolve(ALLOWED_ROOT, 'doc.pdf'));
 		expect(out).toBe('_(attachment: doc.pdf)_');
 		expect(readFileMock).not.toHaveBeenCalled();
+		expect(uploadMock).not.toHaveBeenCalled();
 	});
 
-	it('inlines PNG as base64 markdown when file is readable', async () => {
-		const bytes = Buffer.from('hello-png');
-		readFileMock.mockResolvedValueOnce(bytes);
-
-		const path = resolve(ALLOWED_ROOT, 'cat.png');
-		const out = await inlineMediaAsMarkdown(path);
-		const b64 = bytes.toString('base64');
-
-		expect(out).toBe(`![cat.png](data:image/png;base64,${b64})`);
-		expect(readFileMock).toHaveBeenCalledWith(path);
+	it('uploads PNG to chat-images and returns a proxy-URL markdown tag', async () => {
+		readFileMock.mockResolvedValueOnce(Buffer.from('hello-png'));
+		const out = await uploadMediaAsMarkdown(stub(), OWNER, THREAD, resolve(ALLOWED_ROOT, 'cat.png'));
+		expect(out).toMatch(
+			new RegExp(`^!\\[cat\\.png\\]\\(/api/chat/images/${OWNER}/${THREAD}/[0-9a-f-]+\\.png\\)$`),
+		);
+		const [objectPath, , opts] = uploadMock.mock.calls[0];
+		expect(objectPath).toMatch(new RegExp(`^${OWNER}/${THREAD}/[0-9a-f-]+\\.png$`));
+		expect(opts).toMatchObject({ contentType: 'image/png', upsert: false });
 	});
 
-	it('maps .jpg and .jpeg both to image/jpeg', async () => {
-		readFileMock.mockResolvedValue(Buffer.from('j'));
-		const jpg = await inlineMediaAsMarkdown(resolve(ALLOWED_ROOT, 'a.jpg'));
-		const jpeg = await inlineMediaAsMarkdown(resolve(ALLOWED_ROOT, 'b.jpeg'));
-		expect(jpg).toContain('data:image/jpeg;base64,');
-		expect(jpeg).toContain('data:image/jpeg;base64,');
-	});
-
-	it('returns too-large marker when file exceeds 600 KB', async () => {
-		const big = Buffer.alloc(600 * 1024 + 1);
-		readFileMock.mockResolvedValueOnce(big);
-
-		const out = await inlineMediaAsMarkdown(resolve(ALLOWED_ROOT, 'big.png'));
-		expect(out).toMatch(/^_\(image too large to inline: big\.png, \d+ KB\)_$/);
+	it('returns too-large marker when file exceeds 5 MB (never uploads)', async () => {
+		readFileMock.mockResolvedValueOnce(Buffer.alloc(5 * 1024 * 1024 + 1));
+		const out = await uploadMediaAsMarkdown(stub(), OWNER, THREAD, resolve(ALLOWED_ROOT, 'big.png'));
+		expect(out).toMatch(/^_\(image too large to attach: big\.png, \d+ KB\)_$/);
+		expect(uploadMock).not.toHaveBeenCalled();
 	});
 
 	it('returns unavailable marker when readFile throws', async () => {
 		readFileMock.mockRejectedValueOnce(new Error('ENOENT'));
-		const out = await inlineMediaAsMarkdown(resolve(ALLOWED_ROOT, 'missing.png'));
+		const out = await uploadMediaAsMarkdown(stub(), OWNER, THREAD, resolve(ALLOWED_ROOT, 'missing.png'));
 		expect(out).toBe('_(attachment unavailable: missing.png)_');
+	});
+
+	it('returns unavailable marker when the upload errors', async () => {
+		readFileMock.mockResolvedValueOnce(Buffer.from('x'));
+		uploadMock.mockResolvedValueOnce({ error: { message: 'storage down' } });
+		const out = await uploadMediaAsMarkdown(stub(), OWNER, THREAD, resolve(ALLOWED_ROOT, 'a.png'));
+		expect(out).toBe('_(attachment unavailable: a.png)_');
 	});
 });
 
-// The OpenClaw agent emits an optional `TITLE: <label>` line with its reply
-// (mirrors the existing MEDIA: sentinel). We pull it out, strip it from the
-// body, and persist it under the same manual-wins guard Format uses.
 describe('extractTitleSentinel', () => {
 	it('extracts a TITLE: line and strips it from the body', () => {
-		const { title, body } = extractTitleSentinel(
-			'Here is your answer.\nTITLE: Quarterly tax plan'
-		);
+		const { title, body } = extractTitleSentinel('Here is your answer.\nTITLE: Quarterly tax plan');
 		expect(title).toBe('Quarterly tax plan');
 		expect(body).toBe('Here is your answer.');
 	});
@@ -151,52 +189,122 @@ describe('extractTitleSentinel', () => {
 	});
 });
 
-describe('persistThreadTitle', () => {
-	function makeThreadStub() {
-		const rec: { vals: unknown; eqs: Record<string, unknown> } = { vals: null, eqs: {} };
-		const builder = {
-			update(v: unknown) {
-				rec.vals = v;
-				return builder;
-			},
-			eq(col: string, val: unknown) {
-				rec.eqs[col] = val;
-				return builder;
-			},
-			then(resolve: (r: { error: null }) => void) {
-				resolve({ error: null });
-			}
-		};
-		const from = vi.fn(() => builder);
-		return { supabase: { from } as never, from, rec };
-	}
+describe('sendTextToFormat', () => {
+	it('POSTs the reply to /api/chat/incoming with bearer auth and role=assistant', async () => {
+		const res = await sendTextToFormat(account, { cfg: {}, to: THREAD, text: 'Hello there' });
 
-	it('updates chat_threads.title guarded by title_source = auto', async () => {
-		const { supabase, rec } = makeThreadStub();
-		await persistThreadTitle(supabase, 'thread-1', 'New Title');
-		expect(rec.vals).toEqual({ title: 'New Title' });
-		expect(rec.eqs).toEqual({ id: 'thread-1', title_source: 'auto' });
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		const [url, init] = fetchMock.mock.calls[0];
+		expect(url).toBe('https://format.example/api/chat/incoming'); // trailing slash normalized
+		expect(init.method).toBe('POST');
+		expect(init.headers.authorization).toBe('Bearer whsec_1234567890abcdef');
+		expect(lastPostBody()).toMatchObject({
+			thread_id: THREAD,
+			content: 'Hello there',
+			role: 'assistant',
+			model: 'openclaw/default',
+		});
+		expect(res).toEqual({ messageId: 'msg-1' });
 	});
 
-	it('is a no-op when the title is null (never touches the DB)', async () => {
-		const { supabase, from } = makeThreadStub();
-		await persistThreadTitle(supabase, 'thread-1', null);
-		expect(from).not.toHaveBeenCalled();
+	it('omits suggested_title when there is no TITLE line', async () => {
+		await sendTextToFormat(account, { cfg: {}, to: THREAD, text: 'Hello' });
+		expect(lastPostBody()).not.toHaveProperty('suggested_title');
 	});
 
-	it('never throws when the update returns a DB error (must not fail the reply)', async () => {
-		const builder = {
-			update() {
-				return builder;
-			},
-			eq() {
-				return builder;
-			},
-			then(resolve: (r: { error: { message: string } }) => void) {
-				resolve({ error: { message: 'boom' } });
-			}
-		};
-		const supabase = { from: () => builder } as never;
-		await expect(persistThreadTitle(supabase, 'thread-1', 'X')).resolves.toBeUndefined();
+	it('forwards a TITLE: sentinel as suggested_title and strips it from content', async () => {
+		await sendTextToFormat(account, {
+			cfg: {},
+			to: THREAD,
+			text: 'Your answer.\nTITLE: Tax planning',
+		});
+		const body = lastPostBody();
+		expect(body.suggested_title).toBe('Tax planning');
+		expect(body.content).toBe('Your answer.');
+	});
+
+	it('never writes chat_messages / chat_threads directly for a text reply', async () => {
+		await sendTextToFormat(account, { cfg: {}, to: THREAD, text: 'Hello' });
+		// No media → no owner lookup → the DB client is never touched.
+		expect(fromMock).not.toHaveBeenCalled();
+	});
+
+	it('uploads media and embeds the proxy URL in content (no base64)', async () => {
+		readFileMock.mockResolvedValueOnce(Buffer.from('img-bytes'));
+		await sendTextToFormat(account, {
+			cfg: {},
+			to: THREAD,
+			text: 'See this',
+			mediaUrls: [resolve(ALLOWED_ROOT, 'gen.png')],
+		});
+		expect(fromMock).toHaveBeenCalledWith('chat_threads'); // owner lookup
+		expect(fromMock).not.toHaveBeenCalledWith('chat_messages');
+		expect(uploadMock).toHaveBeenCalledTimes(1);
+		const body = lastPostBody();
+		expect(body.content).toContain('See this');
+		expect(body.content).toMatch(
+			new RegExp(`!\\[gen\\.png\\]\\(/api/chat/images/${OWNER}/${THREAD}/[0-9a-f-]+\\.png\\)`),
+		);
+		expect(body.content).not.toContain('base64');
+	});
+
+	it('degrades to an unavailable marker when the thread owner cannot be resolved', async () => {
+		maybeSingleMock.mockResolvedValueOnce({ data: null, error: null });
+		readFileMock.mockResolvedValue(Buffer.from('x'));
+		await sendTextToFormat(account, {
+			cfg: {},
+			to: THREAD,
+			text: 'See this',
+			mediaUrls: [resolve(ALLOWED_ROOT, 'gen.png')],
+		});
+		expect(uploadMock).not.toHaveBeenCalled();
+		expect(lastPostBody().content).toContain('_(attachment unavailable: gen.png)_');
+	});
+
+	it('returns null and never POSTs when there is no text and no media', async () => {
+		const res = await sendTextToFormat(account, { cfg: {}, to: THREAD, text: '   ' });
+		expect(res).toBeNull();
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it('throws when the endpoint returns a non-2xx response', async () => {
+		fetchMock.mockResolvedValueOnce({ ok: false, status: 401, text: async () => 'Invalid token' });
+		await expect(
+			sendTextToFormat(account, { cfg: {}, to: THREAD, text: 'Hello' }),
+		).rejects.toThrow(/chat\/incoming POST failed: 401/);
+	});
+
+	it('throws when fetch itself rejects (network error)', async () => {
+		fetchMock.mockRejectedValueOnce(new Error('ECONNREFUSED'));
+		await expect(
+			sendTextToFormat(account, { cfg: {}, to: THREAD, text: 'Hello' }),
+		).rejects.toThrow(/ECONNREFUSED/);
+	});
+
+	it('returns an empty messageId when the response body is not JSON', async () => {
+		fetchMock.mockResolvedValueOnce({ ok: true, json: async () => { throw new Error('not json'); } });
+		const res = await sendTextToFormat(account, { cfg: {}, to: THREAD, text: 'Hello' });
+		expect(res).toEqual({ messageId: '' });
+	});
+
+	it('truncates reply text over the 10K cap, keeping media URLs intact', async () => {
+		readFileMock.mockResolvedValueOnce(Buffer.from('img'));
+		await sendTextToFormat(account, {
+			cfg: {},
+			to: THREAD,
+			text: 'A'.repeat(11000),
+			mediaUrls: [resolve(ALLOWED_ROOT, 'gen.png')],
+		});
+		const body = lastPostBody();
+		expect(body.content.length).toBeLessThanOrEqual(10000);
+		expect(body.content).toContain('…(truncated)');
+		// media URL survived the truncation
+		expect(body.content).toMatch(/\/api\/chat\/images\/.+\.png\)/);
+	});
+
+	it('throws when thread_id is missing', async () => {
+		await expect(sendTextToFormat(account, { cfg: {}, to: '  ', text: 'Hello' })).rejects.toThrow(
+			/missing thread_id/,
+		);
 	});
 });
