@@ -12,6 +12,7 @@ import { createChannelReplyPipeline } from 'openclaw/plugin-sdk/channel-reply-pi
 import type { FormatResolvedAccount } from './setup.ts';
 import { getSupabaseClient, sendTextToFormat } from './outbound.ts';
 import { withTitleInstruction } from './title-instruction.ts';
+import { withPublishInstruction } from './publish-instruction.ts';
 import { loadThreadDocumentContext, withDocumentContext } from './document-context.ts';
 import { setRunning, setIdle, setFailed, writeHeartbeat, isThreadCancelling } from './status.ts';
 import { beginThreadStatus, endThreadStatus } from './agent-events.ts';
@@ -527,9 +528,11 @@ async function handleInbound(
 	// or again when the doc changed); a standalone thread / unchanged later turn gets
 	// nothing. Best-effort — a failed read degrades to no doc context, never blocks.
 	const docContext = await loadThreadDocumentContext({ account, threadId, log });
-	const bodyForAgent = withTitleInstruction(
-		withDocumentContext(body, docContext),
-		(threadRow as { title?: string | null } | null)?.title ?? null
+	const bodyForAgent = withPublishInstruction(
+		withTitleInstruction(
+			withDocumentContext(body, docContext),
+			(threadRow as { title?: string | null } | null)?.title ?? null
+		)
 	);
 
 	const msgCtx = {
