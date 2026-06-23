@@ -9,11 +9,21 @@ import {
 	dispatchInboundMessage
 } from 'openclaw/plugin-sdk/reply-runtime';
 import { createChannelReplyPipeline } from 'openclaw/plugin-sdk/channel-reply-pipeline';
+import { saveMediaBuffer } from 'openclaw/plugin-sdk/media-store';
+import { buildAgentMediaPayload, type AgentMediaPayload } from 'openclaw/plugin-sdk/agent-media-payload';
 import type { FormatResolvedAccount } from './setup.ts';
 import { getSupabaseClient, sendTextToFormat } from './outbound.ts';
 import { withTitleInstruction } from './title-instruction.ts';
 import { withPublishInstruction } from './publish-instruction.ts';
 import { loadThreadDocumentContext, withDocumentContext } from './document-context.ts';
+import {
+	partitionAttachments,
+	maxBytesForMime,
+	isImageMime,
+	formatInlinedTextFile,
+	formatAttachmentNote,
+	type InboundAttachment
+} from './inbound-attachments.ts';
 import { setRunning, setIdle, setFailed, writeHeartbeat, isThreadCancelling } from './status.ts';
 import { beginThreadStatus, endThreadStatus } from './agent-events.ts';
 import { startCodexChipReconcile } from './codex-chips.ts';
@@ -135,6 +145,7 @@ type ChatMessageRow = {
 	id: string;
 	thread_id: string;
 	content: string;
+	attachments?: InboundAttachment[] | null;
 	created_at?: string;
 };
 
@@ -384,7 +395,7 @@ async function claimAndDispatchPending(
 	// dispatcher (the failure mode that broke prod when this was poll-only).
 	const { data, error } = await supabase
 		.from('chat_messages')
-		.select('id, thread_id, content, chat_threads!inner(user_id)')
+		.select('id, thread_id, content, attachments, chat_threads!inner(user_id)')
 		.eq('role', 'user')
 		.eq('status', 'pending')
 		.eq('chat_threads.user_id', userId)
@@ -397,6 +408,87 @@ async function claimAndDispatchPending(
 	for (const row of data) {
 		enqueue(row as ChatMessageRow);
 	}
+}
+
+// Attachments live in the private chat-images bucket (migrations 081/083/089);
+// service-role bypasses its RLS. Mirrors outbound.ts's bucket usage.
+const CHAT_IMAGES_BUCKET = 'chat-images';
+
+async function downloadAttachmentBytes(
+	supabase: SupabaseClient,
+	path: string
+): Promise<Buffer | null> {
+	const { data, error } = await supabase.storage.from(CHAT_IMAGES_BUCKET).download(path);
+	if (error || !data) {
+		console.warn('[format-plugin] attachment download failed', { path, error: error?.message });
+		return null;
+	}
+	return Buffer.from(await data.arrayBuffer());
+}
+
+type PreparedMedia = { mediaPayload: AgentMediaPayload | null; inlinedText: string };
+
+// Fetch a message's attachments and shape them for the agent turn: images +
+// binaries are staged into the gateway media store and passed as MediaPaths (the
+// runtime renders images as native model blocks); text/code is inlined into the
+// prompt. Each file degrades independently — a failed fetch is skipped, never
+// failing the whole turn.
+async function prepareInboundMedia(
+	supabase: SupabaseClient,
+	attachments: InboundAttachment[] | null | undefined,
+	log: StartAccountCtx['log']
+): Promise<PreparedMedia> {
+	if (!attachments || attachments.length === 0) return { mediaPayload: null, inlinedText: '' };
+
+	const { images, text, other } = partitionAttachments(attachments);
+	const mediaList: Array<{ path: string; contentType: string }> = [];
+	const textParts: string[] = [];
+
+	// Images first (native model blocks), then other binaries (best-effort media).
+	for (const att of [...images, ...other]) {
+		try {
+			const bytes = await downloadAttachmentBytes(supabase, att.path);
+			if (!bytes) continue;
+			if (bytes.byteLength > maxBytesForMime(att.mime)) {
+				log?.warn?.(`[format] attachment ${att.name} too large (${bytes.byteLength}B) — skipping`);
+				if (!isImageMime(att.mime)) textParts.push(formatAttachmentNote(att.name, att.mime));
+				continue;
+			}
+			const saved = await saveMediaBuffer(
+				bytes,
+				att.mime,
+				undefined,
+				maxBytesForMime(att.mime),
+				att.name
+			);
+			mediaList.push({ path: saved.path, contentType: att.mime });
+			if (!isImageMime(att.mime)) textParts.push(formatAttachmentNote(att.name, att.mime));
+		} catch (err) {
+			log?.warn?.(
+				`[format] failed to stage attachment ${att.name}`,
+				err instanceof Error ? err.message : err
+			);
+		}
+	}
+
+	// Text/code inlined verbatim — the reliable path for non-image content.
+	for (const att of text) {
+		try {
+			const bytes = await downloadAttachmentBytes(supabase, att.path);
+			if (!bytes) continue;
+			textParts.push(formatInlinedTextFile(att.name, bytes.toString('utf8')));
+		} catch (err) {
+			log?.warn?.(
+				`[format] failed to inline attachment ${att.name}`,
+				err instanceof Error ? err.message : err
+			);
+		}
+	}
+
+	return {
+		mediaPayload: mediaList.length > 0 ? buildAgentMediaPayload(mediaList) : null,
+		inlinedText: textParts.length > 0 ? textParts.join('\n\n') : ''
+	};
 }
 
 async function handleInbound(
@@ -528,14 +620,20 @@ async function handleInbound(
 	// or again when the doc changed); a standalone thread / unchanged later turn gets
 	// nothing. Best-effort — a failed read degrades to no doc context, never blocks.
 	const docContext = await loadThreadDocumentContext({ account, threadId, log });
+	// Attachments the user sent: images/PDF/Office are staged as agent media,
+	// text/code is inlined into the agent's view of the message (BodyForAgent only,
+	// so command/title parsing still sees the original text).
+	const { mediaPayload, inlinedText } = await prepareInboundMedia(supabase, row.attachments, log);
+	const agentBody = [body, inlinedText].filter(Boolean).join('\n\n');
 	const bodyForAgent = withPublishInstruction(
 		withTitleInstruction(
-			withDocumentContext(body, docContext),
+			withDocumentContext(agentBody, docContext),
 			(threadRow as { title?: string | null } | null)?.title ?? null
 		)
 	);
 
 	const msgCtx = {
+		...(mediaPayload ?? {}),
 		Body: body,
 		BodyForAgent: bodyForAgent,
 		BodyForCommands: body,
