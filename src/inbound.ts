@@ -15,6 +15,7 @@ import type { FormatResolvedAccount } from './setup.ts';
 import { getSupabaseClient, sendTextToFormat } from './outbound.ts';
 import { withTitleInstruction } from './title-instruction.ts';
 import { withPublishInstruction } from './publish-instruction.ts';
+import { withEditInstruction } from './edit-instruction.ts';
 import { loadThreadDocumentContext, withDocumentContext } from './document-context.ts';
 import {
 	partitionAttachments,
@@ -625,10 +626,12 @@ async function handleInbound(
 	// so command/title parsing still sees the original text).
 	const { mediaPayload, inlinedText } = await prepareInboundMedia(supabase, row.attachments, log);
 	const agentBody = [body, inlinedText].filter(Boolean).join('\n\n');
-	const bodyForAgent = withPublishInstruction(
-		withTitleInstruction(
-			withDocumentContext(agentBody, docContext),
-			(threadRow as { title?: string | null } | null)?.title ?? null
+	const bodyForAgent = withEditInstruction(
+		withPublishInstruction(
+			withTitleInstruction(
+				withDocumentContext(agentBody, docContext),
+				(threadRow as { title?: string | null } | null)?.title ?? null
+			)
 		)
 	);
 
